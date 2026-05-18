@@ -43,7 +43,7 @@ const today = new Date(); today.setHours(0,0,0,0);
 const daysFrom  = d => { if (!d) return null; const t = new Date(d); return isNaN(t) ? null : Math.ceil((t - today) / 86400000); };
 const urgencyOf = row => {
   if (row.status === "Implemented") return "done";
-  const d = daysFrom(row.target);
+  const d = daysFrom(row.target_date);
   if (d === null) return "none";
   if (d < 0)  return "overdue";
   if (d < 7)  return "critical";
@@ -55,20 +55,22 @@ const unique  = arr => [...new Set(arr.filter(Boolean))].sort();
 
 // Parse Supabase row → app shape
 const parseRow = row => ({
-  id:        row.id,
-  partNo:    (row.part_no    || "").trim(),
-  partName:  (row.part_name  || "").trim(),
-  engineer:  (row.engineer   || "").trim(),
-  commodity: (row.commodity  || "").trim(),
-  activity:  (row.activity   || "").trim(),
-  priority:  (row.priority   || "Medium").trim(),
-  status:    (row.status     || "Pending").trim(),
-  target:    (row.target     || "").trim(),
-  actual:    (row.actual     || "").trim(),
+  id:           row.id,
+  partNo:       (row.part_no      || "").trim(),
+  partName:     (row.part_name    || "").trim(),
+  engineer:     (row.engineer     || "").trim(),
+  commodity:    (row.commodity    || "").trim(),
+  category:     (row.category     || "").trim(),
+  model:        (row.model        || "").trim(),
+  priority:     (row.priority     || "Medium").trim(),
+  status:       (row.status       || "Pending").trim(),
+  initial_date: (row.initial_date || "").trim(),
+  target_date:  (row.target_date  || "").trim(),
+  actual:       (row.actual       || "").trim(),
 });
 
 // Map app field → Supabase column
-const toCol = f => ({ partNo:"part_no", partName:"part_name" }[f] || f);
+const toCol = f => ({ partNo:"part_no", partName:"part_name", target_date:"target_date", initial_date:"initial_date" }[f] || f);
 
 // Normalise an Excel serial date or string → "YYYY-MM-DD"
 const normaliseDate = val => {
@@ -95,23 +97,28 @@ const normaliseDate = val => {
 // ─── Column auto-mapper ───────────────────────────────────────────────────────
 // Maps any reasonable Excel header → our internal field name
 const FIELD_ALIASES = {
-  partNo:    ["part no","part#","part number","partno","part_no","pn","no"],
-  partName:  ["part name","partname","part_name","name","description","desc","part description"],
-  engineer:  ["engineer","eng","owner","assigned to","assignee"],
-  commodity: ["commodity","category","type","group","com"],
-  activity:  ["activity","action","phase","stage","act"],
-  priority:  ["priority","pri","urgency","sev","severity"],
-  status:    ["status","state","sts","progress"],
-  target:    ["target","target date","due","due date","deadline","planned date","target_date"],
-  actual:    ["actual","actual date","completed","completion date","actual_date","done date"],
+  partNo:       ["part no","part#","part number","partno","part_no","pn","no","part no."],
+  partName:     ["part name","partname","part_name","name","description","desc","part description","item name","item"],
+  engineer:     ["engineer","eng","owner","assigned to","assignee","engineers"],
+  commodity:    ["commodity","commodities","type","group","com","commodity name"],
+  category:     ["category","categories","activity","action","phase","stage","act","cat"],
+  model:        ["model","model name","model no","model number","models","variant"],
+  priority:     ["priority","pri","urgency","sev","severity","priorities"],
+  status:       ["status","state","sts","progress","current status"],
+  initial_date: ["initial date","initial_date","initialdate","start date","start","start_date","begin date","from date","initial","begin","kickoff date","raised date"],
+  target_date:  ["target","target date","target_date","targetdate","due","due date","deadline","planned date","completion target","end date"],
+  actual:       ["actual","actual date","actual_date","actualdate","completed","completion date","done date","closed date","finish date"],
 };
 
 const autoMap = headers => {
   const map = {};
   headers.forEach(h => {
-    const norm = h.toLowerCase().trim();
+    const norm = h.toLowerCase().replace(/\s+/g, " ").trim();
     for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
-      if (aliases.includes(norm) && !map[field]) { map[field] = h; break; }
+      if (!map[field] && aliases.some(a => a === norm)) {
+        map[field] = h;
+        break;
+      }
     }
   });
   return map;
@@ -158,23 +165,38 @@ function HBar({ label, impl, pend, total, color, onClick, active }) {
 }
 
 // ─── Month Chart ──────────────────────────────────────────────────────────────
+// Counts tasks per month based on the span between initial_date and target_date.
+// A task "belongs" to every month in its [initial_date, target_date] range.
+// Completed = status Implemented (shown by target_date month); In Progress = others (by target_date month).
 function MonthChart({ tasks }) {
-  const data = MONTHS.map((m,i) => ({
-    m,
-    impl: tasks.filter(t => t.status==="Implemented" && monthOf(t.actual)===i).length,
-    pend: tasks.filter(t => t.status!=="Implemented" && monthOf(t.target)===i).length,
-  }));
-  const max = Math.max(...data.map(d => d.impl+d.pend), 1);
+  const data = MONTHS.map((m, i) => {
+    const completed = tasks.filter(t => {
+      if (t.status !== "Implemented") return false;
+      const tMonth = monthOf(t.target_date);
+      return tMonth === i;
+    }).length;
+    const inProgress = tasks.filter(t => {
+      if (t.status === "Implemented") return false;
+      const iMonth = monthOf(t.initial_date);
+      const tMonth = monthOf(t.target_date);
+      if (tMonth === null) return false;
+      // Task spans this month if initial_date month <= i <= target_date month
+      const start = iMonth !== null ? iMonth : tMonth;
+      return i >= start && i <= tMonth;
+    }).length;
+    return { m, completed, inProgress };
+  });
+  const max = Math.max(...data.map(d => d.completed + d.inProgress), 1);
   return (
     <div style={{display:"flex",alignItems:"flex-end",gap:3,height:72,padding:"0 2px"}}>
       {data.map(d => {
-        const total = d.impl+d.pend;
+        const total = d.completed + d.inProgress;
         return (
           <div key={d.m} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:1}}>
             <span style={{fontSize:7,color:total>0?"#94a3b8":"transparent",fontWeight:700,marginBottom:1,lineHeight:1}}>{total||0}</span>
             <div style={{width:"100%",display:"flex",flexDirection:"column",justifyContent:"flex-end",height:46,gap:1}}>
-              {d.impl>0 && <div style={{width:"100%",height:`${(d.impl/max)*46}px`,background:"#22c55e",borderRadius:"2px 2px 0 0",minHeight:2}}/>}
-              {d.pend>0 && <div style={{width:"100%",height:`${(d.pend/max)*46}px`,background:"#f59e0b",borderRadius:d.impl?"0":"2px 2px 0 0",minHeight:2}}/>}
+              {d.completed>0 && <div style={{width:"100%",height:`${(d.completed/max)*46}px`,background:"#22c55e",borderRadius:"2px 2px 0 0",minHeight:2}}/>}
+              {d.inProgress>0 && <div style={{width:"100%",height:`${(d.inProgress/max)*46}px`,background:"#38bdf8",borderRadius:d.completed?"0":"2px 2px 0 0",minHeight:2}}/>}
             </div>
             <span style={{fontSize:7,color:"#334155"}}>{d.m}</span>
           </div>
@@ -184,12 +206,12 @@ function MonthChart({ tasks }) {
   );
 }
 
-// ─── Activity Chart ───────────────────────────────────────────────────────────
+// ─── Category Chart ───────────────────────────────────────────────────────────
 function ActivityChart({ tasks, activities }) {
   const data = activities.map(a => ({
     a: a.length>14 ? a.slice(0,13)+"…" : a, full:a,
-    impl: tasks.filter(t => t.activity===a && t.status==="Implemented").length,
-    pend: tasks.filter(t => t.activity===a && t.status!=="Implemented").length,
+    impl: tasks.filter(t => t.category===a && t.status==="Implemented").length,
+    pend: tasks.filter(t => t.category===a && t.status!=="Implemented").length,
   }));
   const max = Math.max(...data.map(d => d.impl+d.pend), 1);
   return (
@@ -225,8 +247,8 @@ function Spinner({ msg }) {
 
 // ─── Add Task Modal ───────────────────────────────────────────────────────────
 function AddModal({ onClose, onSave, saving }) {
-  const EMPTY = { partNo:"", partName:"", engineer:"", commodity:"", activity:"",
-    priority:"Medium", status:"Pending", target:"", actual:"" };
+  const EMPTY = { partNo:"", partName:"", engineer:"", commodity:"", category:"", model:"",
+    priority:"Medium", status:"Pending", initial_date:"", target_date:"", actual:"" };
   const [form, setForm] = useState(EMPTY);
   const set = (k,v) => setForm(f => ({...f,[k]:v}));
   const inp = { width:"100%", background:"#0f2540", border:"1px solid #1e3a5f", borderRadius:8,
@@ -245,7 +267,7 @@ function AddModal({ onClose, onSave, saving }) {
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
           {[["Part Number","partNo","e.g. RBR-013"],["Part Name","partName","e.g. Exhaust Gasket"],
             ["Engineer","engineer","Engineer name"],["Commodity","commodity","e.g. Fasteners"],
-            ["Activity","activity","e.g. PPAP"]].map(([l,k,ph]) => (
+            ["Category","category","e.g. PPAP"],["Model","model","e.g. Model X"]].map(([l,k,ph]) => (
             <div key={k}><label style={lbl}>{l}</label>
               <input style={inp} value={form[k]} onChange={e => set(k,e.target.value)} placeholder={ph}/>
             </div>
@@ -257,8 +279,10 @@ function AddModal({ onClose, onSave, saving }) {
               </select>
             </div>
           ))}
+          <div><label style={lbl}>Initial Date</label>
+            <input type="date" style={inp} value={form.initial_date} onChange={e => set("initial_date",e.target.value)}/></div>
           <div><label style={lbl}>Target Date</label>
-            <input type="date" style={inp} value={form.target} onChange={e => set("target",e.target.value)}/></div>
+            <input type="date" style={inp} value={form.target_date} onChange={e => set("target_date",e.target.value)}/></div>
           <div><label style={lbl}>Actual Date</label>
             <input type="date" style={inp} value={form.actual} onChange={e => set("actual",e.target.value)}/></div>
         </div>
@@ -287,10 +311,11 @@ function ImportModal({ onClose, onImport, importing }) {
   const [step,    setStep]    = useState("upload");// upload | map | preview
   const [error,   setError]   = useState("");
 
-  const appFields = ["partNo","partName","engineer","commodity","activity","priority","status","target","actual"];
+  const appFields = ["partNo","partName","engineer","commodity","category","model","priority","status","initial_date","target_date","actual"];
   const fieldLabels = { partNo:"Part No", partName:"Part Name", engineer:"Engineer",
-    commodity:"Commodity", activity:"Activity", priority:"Priority",
-    status:"Status", target:"Target Date", actual:"Actual Date" };
+    commodity:"Commodity", category:"Category", model:"Model",
+    priority:"Priority", status:"Status",
+    initial_date:"Initial Date", target_date:"Target Date", actual:"Actual Date" };
 
   const handleFile = e => {
     const file = e.target.files[0];
@@ -322,7 +347,7 @@ function ImportModal({ onClose, onImport, importing }) {
     appFields.forEach(f => {
       const col = mapping[f];
       let val = col ? String(r[col]||"").trim() : "";
-      if (f==="target"||f==="actual") val = normaliseDate(col ? r[col] : "");
+      if (f==="target_date"||f==="initial_date"||f==="actual") val = normaliseDate(col ? r[col] : "");
       obj[f] = val;
     });
     return obj;
@@ -333,7 +358,7 @@ function ImportModal({ onClose, onImport, importing }) {
     appFields.forEach(f => {
       const col = mapping[f];
       let val = col ? String(r[col]||"").trim() : "";
-      if (f==="target"||f==="actual") val = normaliseDate(col ? r[col] : "");
+      if (f==="target_date"||f==="initial_date"||f==="actual") val = normaliseDate(col ? r[col] : "");
       obj[f] = val;
     });
     return obj;
@@ -494,7 +519,7 @@ export default function App() {
   // ── DERIVED LISTS ─────────────────────────────────────────────────────────
   const engineers   = useMemo(() => unique(tasks.map(t => t.engineer)),  [tasks]);
   const commodities = useMemo(() => unique(tasks.map(t => t.commodity)), [tasks]);
-  const activities  = useMemo(() => unique(tasks.map(t => t.activity)),  [tasks]);
+  const activities  = useMemo(() => unique(tasks.map(t => t.category)),  [tasks]);
   const statuses    = useMemo(() => {
     const inData = unique(tasks.map(t => t.status));
     const ordered = STATUSES.filter(s => inData.includes(s));
@@ -529,15 +554,17 @@ export default function App() {
       const res = await sbFetch(TABLE, {
         method:"POST",
         body: JSON.stringify({
-          part_no:   form.partNo,
-          part_name: form.partName,
-          engineer:  form.engineer,
-          commodity: form.commodity,
-          activity:  form.activity,
-          priority:  form.priority,
-          status:    form.status,
-          target:    form.target || null,
-          actual:    form.actual || null,
+          part_no:      form.partNo,
+          part_name:    form.partName,
+          engineer:     form.engineer,
+          commodity:    form.commodity,
+          category:     form.category,
+          model:        form.model || null,
+          priority:     form.priority,
+          status:       form.status,
+          initial_date: form.initial_date || null,
+          target_date:  form.target_date || null,
+          actual:       form.actual || null,
         }),
       });
       if (!res.ok) {
@@ -570,15 +597,17 @@ export default function App() {
     try {
       // Supabase allows bulk insert in one POST
       const payload = rows.map(r => ({
-        part_no:   r.partNo   || null,
-        part_name: r.partName || null,
-        engineer:  r.engineer || null,
-        commodity: r.commodity|| null,
-        activity:  r.activity || null,
-        priority:  PRIORITIES.includes(r.priority) ? r.priority : "Medium",
-        status:    STATUSES.includes(r.status)     ? r.status   : "Pending",
-        target:    r.target   || null,
-        actual:    r.actual   || null,
+        part_no:      r.partNo   || null,
+        part_name:    r.partName || null,
+        engineer:     r.engineer || null,
+        commodity:    r.commodity|| null,
+        category:     r.category || null,
+        model:        r.model    || null,
+        priority:     PRIORITIES.includes(r.priority) ? r.priority : "Medium",
+        status:       STATUSES.includes(r.status)     ? r.status   : "Pending",
+        initial_date: r.initial_date || null,
+        target_date:  r.target_date  || null,
+        actual:       r.actual   || null,
       })).filter(r => r.part_no || r.part_name);
 
       const CHUNK = 50; // Supabase handles bulk fine; chunk for safety
@@ -610,7 +639,7 @@ export default function App() {
     if (q && !t.partNo.toLowerCase().includes(q) && !t.partName.toLowerCase().includes(q)) return false;
     if (fEng !=="All" && t.engineer  !==fEng)  return false;
     if (fCom !=="All" && t.commodity !==fCom)  return false;
-    if (fAct !=="All" && t.activity  !==fAct)  return false;
+    if (fAct !=="All" && t.category  !==fAct)  return false;
     if (fStat!=="All" && t.status    !==fStat) return false;
     return true;
   }), [tasks,search,fEng,fCom,fAct,fStat]);
@@ -627,8 +656,8 @@ export default function App() {
     name:c,
     cols: activities.map(a => ({
       name:a,
-      impl: tasks.filter(t => t.commodity===c && t.activity===a && t.status==="Implemented").length,
-      pend: tasks.filter(t => t.commodity===c && t.activity===a && t.status!=="Implemented").length,
+      impl: tasks.filter(t => t.commodity===c && t.category===a && t.status==="Implemented").length,
+      pend: tasks.filter(t => t.commodity===c && t.category===a && t.status!=="Implemented").length,
     })),
   })), [tasks,commodities,activities]);
 
@@ -652,7 +681,7 @@ export default function App() {
 
   const sidebarItems = useMemo(() =>
     tasks.filter(t => t.status!=="Implemented")
-      .map(t => ({...t, urg:urgencyOf(t), days:daysFrom(t.target)}))
+      .map(t => ({...t, urg:urgencyOf(t), days:daysFrom(t.target_date)}))
       .sort((a,b) => ({overdue:0,critical:1,warning:2,ok:3,none:4}[a.urg] - {overdue:0,critical:1,warning:2,ok:3,none:4}[b.urg])),
   [tasks]);
 
@@ -707,7 +736,7 @@ export default function App() {
           {commodities.map(x => <option key={x}>{x}</option>)}
         </select>
         <select style={S.sel} value={fAct}  onChange={e => setFAct(e.target.value)}>
-          <option value="All">All Activities</option>
+          <option value="All">All Categories</option>
           {activities.map(x => <option key={x}>{x}</option>)}
         </select>
         <select style={S.sel} value={fStat} onChange={e => setFStat(e.target.value)}>
@@ -801,13 +830,13 @@ export default function App() {
             <div style={S.cT}>Monthly {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
             <MonthChart tasks={engTasks}/>
             <div style={{display:"flex",gap:10,marginTop:4,justifyContent:"center"}}>
-              <span style={{fontSize:9,color:"#22c55e"}}>▮ Implemented</span>
-              <span style={{fontSize:9,color:"#f59e0b"}}>▮ Pending/Other</span>
+              <span style={{fontSize:9,color:"#22c55e"}}>▮ Completed</span>
+              <span style={{fontSize:9,color:"#38bdf8"}}>▮ In Progress</span>
             </div>
           </div>
 
           <div style={S.card}>
-            <div style={S.cT}>By Activity {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
+            <div style={S.cT}>By Category {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
             <ActivityChart tasks={engTasks} activities={activities}/>
           </div>
         </div>
@@ -815,7 +844,7 @@ export default function App() {
         {/* CENTER */}
         <div style={S.ctr}>
           <div style={S.tabB}>
-            {[["table","Tracking Table"],["matrix","Commodity Matrix"],["gantt","Timeline / Gantt"]].map(([k,l]) => (
+            {[["table","Tracking Table"],["matrix","Commodity Matrix"],["gantt","Timeline / Gantt"],["monthly","Monthly Dashboard"]].map(([k,l]) => (
               <button key={k} style={S.tab(activeTab===k)} onClick={() => setActiveTab(k)}>{l}</button>
             ))}
           </div>
@@ -825,20 +854,21 @@ export default function App() {
             <div style={{...S.card,padding:0,overflowX:"auto"}}>
               <table style={S.tbl}>
                 <thead>
-                  <tr>{["Part #","Part Name","Engineer","Commodity","Activity","Priority","Status","Target","Overdue Days","Delete"].map(h => (
+                  <tr>{["Part #","Part Name","Engineer","Commodity","Category","Model","Priority","Status","Initial Date","Target Date","Overdue Days","Delete"].map(h => (
                     <th key={h} style={S.th}>{h}</th>
                   ))}</tr>
                 </thead>
                 <tbody>
                   {filteredRows.map(row => {
-                    const urg = urgencyOf(row), days = daysFrom(row.target);
+                    const urg = urgencyOf(row), days = daysFrom(row.target_date);
                     return (
                       <tr key={row.id} style={{background:urg==="overdue"||urg==="critical"?"#ff44440a":"transparent"}}>
                         <td style={S.td}><input style={S.iTxt} value={row.partNo}    onChange={e => updateField(row,"partNo",e.target.value)}/></td>
                         <td style={{...S.td,maxWidth:150}}><input style={{...S.iTxt,minWidth:90}} value={row.partName}  onChange={e => updateField(row,"partName",e.target.value)}/></td>
                         <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.engineer}  onChange={e => updateField(row,"engineer",e.target.value)}/></td>
                         <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.commodity} onChange={e => updateField(row,"commodity",e.target.value)}/></td>
-                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.activity}  onChange={e => updateField(row,"activity",e.target.value)}/></td>
+                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.category}  onChange={e => updateField(row,"category",e.target.value)}/></td>
+                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.model}     onChange={e => updateField(row,"model",e.target.value)}/></td>
                         <td style={S.td}>
                           <select style={S.iSel(priorityColor[row.priority]||"#94a3b8")} value={row.priority} onChange={e => updateField(row,"priority",e.target.value)}>
                             {PRIORITIES.map(p => <option key={p}>{p}</option>)}
@@ -850,7 +880,10 @@ export default function App() {
                           </select>
                         </td>
                         <td style={S.td}>
-                          <input type="date" style={{...S.iTxt,fontSize:10,color:"#94a3b8",minWidth:110}} value={row.target} onChange={e => updateField(row,"target",e.target.value)}/>
+                          <input type="date" style={{...S.iTxt,fontSize:10,color:"#94a3b8",minWidth:110}} value={row.initial_date} onChange={e => updateField(row,"initial_date",e.target.value)}/>
+                        </td>
+                        <td style={S.td}>
+                          <input type="date" style={{...S.iTxt,fontSize:10,color:"#94a3b8",minWidth:110}} value={row.target_date} onChange={e => updateField(row,"target_date",e.target.value)}/>
                         </td>
                         <td style={{...S.td,fontWeight:700,fontSize:11,whiteSpace:"nowrap",
                           color:days===null?"#64748b":days<0?"#ff4444":days<7?"#ff8800":days<15?"#f5c518":"#22c55e"}}>
@@ -883,7 +916,7 @@ export default function App() {
               <table style={{...S.tbl,fontSize:10,marginTop:4}}>
                 <thead>
                   <tr>
-                    <th style={{...S.th,padding:"8px 14px"}}>Commodity ╲ Activity</th>
+                    <th style={{...S.th,padding:"8px 14px"}}>Commodity ╲ Category</th>
                     {activities.map(a => <th key={a} style={{...S.th,textAlign:"center"}}>{a}</th>)}
                     <th style={{...S.th,textAlign:"center"}}>Total</th>
                   </tr>
@@ -920,7 +953,7 @@ export default function App() {
             <div style={S.card}>
               <div style={S.cT}>Timeline — Elapsed Progress</div>
               {filteredRows.map(row => {
-                const start = new Date("2025-01-01"), end = row.target ? new Date(row.target) : new Date("2025-12-31");
+                const start = new Date("2025-01-01"), end = row.target_date ? new Date(row.target_date) : new Date("2025-12-31");
                 const elapsed = Math.min(Math.max((today-start)/Math.max(end-start,1),0),1);
                 const urg = urgencyOf(row);
                 const bc = urg==="overdue"||urg==="critical"?"#ff4444":urg==="warning"?"#f5c518":"#22c55e";
@@ -928,7 +961,7 @@ export default function App() {
                   <div key={row.id} style={{marginBottom:9}}>
                     <div style={{display:"flex",justifyContent:"space-between",marginBottom:2,fontSize:10}}>
                       <span><code style={{color:"#38bdf8"}}>{row.partNo}</code> — {row.partName}</span>
-                      <span style={{color:"#64748b"}}>{row.engineer} · {row.target||"—"}</span>
+                      <span style={{color:"#64748b"}}>{row.engineer} · {row.target_date||"—"}</span>
                     </div>
                     <div style={{background:"#0f2540",borderRadius:4,height:11,position:"relative",overflow:"hidden"}}>
                       <div style={{width:`${elapsed*100}%`,height:"100%",background:bc,transition:"width .5s",boxShadow:`0 0 5px ${bc}88`}}/>
@@ -940,6 +973,84 @@ export default function App() {
               {filteredRows.length===0 && <div style={{color:"#64748b",textAlign:"center",padding:20}}>No tasks match filters.</div>}
             </div>
           )}
+
+          {/* MONTHLY DASHBOARD */}
+          {activeTab==="monthly" && (() => {
+            const monthlyData = MONTHS.map((m, i) => {
+              const completed = filteredRows.filter(t => {
+                if (t.status !== "Implemented") return false;
+                return monthOf(t.target_date) === i;
+              });
+              const inProgress = filteredRows.filter(t => {
+                if (t.status === "Implemented") return false;
+                const iM = monthOf(t.initial_date);
+                const tM = monthOf(t.target_date);
+                if (tM === null) return false;
+                const start = iM !== null ? iM : tM;
+                return i >= start && i <= tM;
+              });
+              return { m, i, completed, inProgress };
+            }).filter(d => d.completed.length + d.inProgress.length > 0);
+
+            return (
+              <div style={{...S.card,overflowX:"auto"}}>
+                <div style={S.cT}>Monthly Dashboard — Completed vs In Progress (by Initial → Target Date range)</div>
+                {monthlyData.length === 0
+                  ? <div style={{color:"#64748b",textAlign:"center",padding:24}}>No tasks with date ranges match the current filters.</div>
+                  : (
+                  <table style={{...S.tbl,fontSize:11,marginTop:4}}>
+                    <thead>
+                      <tr>
+                        <th style={S.th}>Month</th>
+                        <th style={{...S.th,textAlign:"center",color:"#22c55e"}}>✓ Completed</th>
+                        <th style={{...S.th,textAlign:"center",color:"#38bdf8"}}>◷ In Progress</th>
+                        <th style={{...S.th,textAlign:"center"}}>Total</th>
+                        <th style={{...S.th}}>Progress Bar</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {monthlyData.map(d => {
+                        const total = d.completed.length + d.inProgress.length;
+                        const pct = total ? Math.round((d.completed.length/total)*100) : 0;
+                        return (
+                          <tr key={d.m}>
+                            <td style={{...S.td,fontWeight:700,color:"#94a3b8",minWidth:40}}>{d.m}</td>
+                            <td style={{...S.td,textAlign:"center",fontWeight:700,color:"#22c55e"}}>{d.completed.length}</td>
+                            <td style={{...S.td,textAlign:"center",fontWeight:700,color:"#38bdf8"}}>{d.inProgress.length}</td>
+                            <td style={{...S.td,textAlign:"center",fontWeight:700,color:"#e2e8f0"}}>{total}</td>
+                            <td style={{...S.td,minWidth:160}}>
+                              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                <div style={{flex:1,background:"#1e293b",borderRadius:4,height:8,overflow:"hidden",display:"flex"}}>
+                                  <div style={{width:`${pct}%`,background:"#22c55e",transition:"width .5s"}}/>
+                                  <div style={{width:`${100-pct}%`,background:"#38bdf833",transition:"width .5s"}}/>
+                                </div>
+                                <span style={{fontSize:10,color:"#64748b",minWidth:30}}>{pct}%</span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{borderTop:"1px solid #1e3a5f"}}>
+                        <td style={{...S.td,fontWeight:800,color:"#38bdf8"}}>TOTAL</td>
+                        <td style={{...S.td,textAlign:"center",fontWeight:800,color:"#22c55e"}}>
+                          {monthlyData.reduce((a,d)=>a+d.completed.length,0)}
+                        </td>
+                        <td style={{...S.td,textAlign:"center",fontWeight:800,color:"#38bdf8"}}>
+                          {monthlyData.reduce((a,d)=>a+d.inProgress.length,0)}
+                        </td>
+                        <td style={{...S.td,textAlign:"center",fontWeight:800,color:"#e2e8f0"}}>
+                          {monthlyData.reduce((a,d)=>a+d.completed.length+d.inProgress.length,0)}
+                        </td>
+                        <td style={S.td}/>
+                      </tr>
+                    </tfoot>
+                  </table>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         {/* RIGHT SIDEBAR */}
