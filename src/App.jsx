@@ -1,10 +1,24 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import * as XLSX from "xlsx";
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-const SHEETDB_URL = import.meta.env.VITE_SHEETDB_URL || "";
-const REFRESH_MS  = 30_000;
+// ─── SUPABASE CONFIG ──────────────────────────────────────────────────────────
+const SUPABASE_URL  = "https://xdynkskncnljbekqqgix.supabase.co";
+const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhkeW5rc2tuY25samJla3FxZ2l4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMjMwNjQsImV4cCI6MjA5NDU5OTA2NH0.DKOU1UbrxwjE18gLzwiK0D8KtOs756BcbnLc5ufiMQ8";
+const TABLE = "tasks";
+const HEADERS = {
+  "Content-Type":  "application/json",
+  "apikey":        SUPABASE_ANON,
+  "Authorization": `Bearer ${SUPABASE_ANON}`,
+  "Prefer":        "return=representation",
+};
 
-// ─── FIXED lookup lists (order + color only — NOT used for graph data) ────────
+const sbFetch = (path, opts = {}) =>
+  fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...opts,
+    headers: { ...HEADERS, ...(opts.headers || {}) },
+  });
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const STATUSES   = ["Pending", "In Progress", "Implemented", "On Hold"];
 const PRIORITIES = ["Critical", "High", "Medium", "Low"];
 const MONTHS     = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -12,7 +26,6 @@ const MONTHS     = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct",
 const priorityColor = { Critical:"#ff4444", High:"#ff8800", Medium:"#f5c518", Low:"#22c55e" };
 const statusColor   = { Pending:"#f59e0b", "In Progress":"#38bdf8", Implemented:"#22c55e", "On Hold":"#94a3b8" };
 
-// Auto-assign colors to any engineer found in the sheet
 const ENG_PALETTE = ["#38bdf8","#a78bfa","#34d399","#fb923c","#f472b6","#facc15","#60a5fa","#4ade80"];
 const getEngColor = (name, list) => ENG_PALETTE[list.indexOf(name) % ENG_PALETTE.length];
 
@@ -27,44 +40,106 @@ const urgencyMeta = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const today = new Date(); today.setHours(0,0,0,0);
-const daysFrom = d => { if(!d) return null; const t=new Date(d); return isNaN(t)?null:Math.ceil((t-today)/86400000); };
+const daysFrom  = d => { if (!d) return null; const t = new Date(d); return isNaN(t) ? null : Math.ceil((t - today) / 86400000); };
 const urgencyOf = row => {
-  if(row.status==="Implemented") return "done";
-  const d=daysFrom(row.target);
-  if(d===null) return "none";
-  if(d<0)  return "overdue";
-  if(d<7)  return "critical";
-  if(d<15) return "warning";
+  if (row.status === "Implemented") return "done";
+  const d = daysFrom(row.target);
+  if (d === null) return "none";
+  if (d < 0)  return "overdue";
+  if (d < 7)  return "critical";
+  if (d < 15) return "warning";
   return "ok";
 };
-const monthOf = d => { if(!d) return null; const t=new Date(d); return isNaN(t)?null:t.getMonth(); };
+const monthOf = d => { if (!d) return null; const t = new Date(d); return isNaN(t) ? null : t.getMonth(); };
+const unique  = arr => [...new Set(arr.filter(Boolean))].sort();
 
-// Derive unique sorted values from actual sheet data
-const unique = (arr) => [...new Set(arr.filter(Boolean))].sort();
+// Parse Supabase row → app shape
+const parseRow = row => ({
+  id:        row.id,
+  partNo:    (row.part_no    || "").trim(),
+  partName:  (row.part_name  || "").trim(),
+  engineer:  (row.engineer   || "").trim(),
+  commodity: (row.commodity  || "").trim(),
+  activity:  (row.activity   || "").trim(),
+  priority:  (row.priority   || "Medium").trim(),
+  status:    (row.status     || "Pending").trim(),
+  target:    (row.target     || "").trim(),
+  actual:    (row.actual     || "").trim(),
+});
+
+// Map app field → Supabase column
+const toCol = f => ({ partNo:"part_no", partName:"part_name" }[f] || f);
+
+// Normalise an Excel serial date or string → "YYYY-MM-DD"
+const normaliseDate = val => {
+  if (!val) return "";
+  if (typeof val === "number") {
+    // Excel date serial
+    const d = XLSX.SSF.parse_date_code(val);
+    if (!d) return "";
+    const mm = String(d.m).padStart(2,"0"), dd = String(d.d).padStart(2,"0");
+    return `${d.y}-${mm}-${dd}`;
+  }
+  const s = String(val).trim();
+  // Already ISO
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+  // DD-MM-YYYY or DD/MM/YYYY
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m) {
+    const y = m[3].length === 2 ? "20"+m[3] : m[3];
+    return `${y}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+  }
+  return s;
+};
+
+// ─── Column auto-mapper ───────────────────────────────────────────────────────
+// Maps any reasonable Excel header → our internal field name
+const FIELD_ALIASES = {
+  partNo:    ["part no","part#","part number","partno","part_no","pn","no"],
+  partName:  ["part name","partname","part_name","name","description","desc","part description"],
+  engineer:  ["engineer","eng","owner","assigned to","assignee"],
+  commodity: ["commodity","category","type","group","com"],
+  activity:  ["activity","action","phase","stage","act"],
+  priority:  ["priority","pri","urgency","sev","severity"],
+  status:    ["status","state","sts","progress"],
+  target:    ["target","target date","due","due date","deadline","planned date","target_date"],
+  actual:    ["actual","actual date","completed","completion date","actual_date","done date"],
+};
+
+const autoMap = headers => {
+  const map = {};
+  headers.forEach(h => {
+    const norm = h.toLowerCase().trim();
+    for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
+      if (aliases.includes(norm) && !map[field]) { map[field] = h; break; }
+    }
+  });
+  return map;
+};
 
 // ─── SVG Donut ────────────────────────────────────────────────────────────────
 function Donut({ data, size=110 }) {
-  const total = data.reduce((a,b)=>a+b.v,0)||1;
+  const total = data.reduce((a,b) => a+b.v, 0) || 1;
   const r=38, cx=50, cy=50, circ=2*Math.PI*r;
   let offset=0;
-  const segs = data.map(d=>{ const s={...d,pct:d.v/total,offset}; offset+=s.pct; return s; });
+  const segs = data.map(d => { const s={...d,pct:d.v/total,offset}; offset+=s.pct; return s; });
   return (
     <svg viewBox="0 0 100 100" style={{width:size,height:size}}>
       <circle cx={cx} cy={cy} r={r} fill="none" stroke="#1e293b" strokeWidth={13}/>
-      {segs.map((s,i)=>(
+      {segs.map((s,i) => (
         <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke={s.color} strokeWidth={13}
           strokeDasharray={`${s.pct*circ} ${circ}`} strokeDashoffset={-s.offset*circ}
           style={{transform:"rotate(-90deg)",transformOrigin:"50% 50%",filter:`drop-shadow(0 0 3px ${s.color})`}}/>
       ))}
       <text x={cx} y={cy-5} textAnchor="middle" fill="#e2e8f0" fontSize="15" fontWeight="bold">
-        {data.reduce((a,b)=>a+b.v,0)}
+        {data.reduce((a,b) => a+b.v, 0)}
       </text>
       <text x={cx} y={cy+9} textAnchor="middle" fill="#64748b" fontSize="7">TASKS</text>
     </svg>
   );
 }
 
-// ─── Engineer Bar (always from ALL tasks) ─────────────────────────────────────
+// ─── Engineer Bar ─────────────────────────────────────────────────────────────
 function HBar({ label, impl, pend, total, color, onClick, active }) {
   const pct = total ? Math.round((impl/total)*100) : 0;
   return (
@@ -75,34 +150,31 @@ function HBar({ label, impl, pend, total, color, onClick, active }) {
         <span style={{color:active?"#38bdf8":"#94a3b8",fontWeight:active?700:400}}>{label}</span>
         <span><span style={{color:"#22c55e"}}>✓{impl} </span><span style={{color:"#f59e0b"}}>◷{pend}</span></span>
       </div>
-      <div style={{background:"#1e293b",borderRadius:3,height:7,overflow:"hidden",display:"flex"}}>
+      <div style={{background:"#1e293b",borderRadius:3,height:7,overflow:"hidden"}}>
         <div style={{width:`${pct}%`,height:"100%",background:color,transition:"width .5s",borderRadius:3}}/>
       </div>
     </div>
   );
 }
 
-// ─── Month Chart — driven by passed tasks (live from sheet) ──────────────────
+// ─── Month Chart ──────────────────────────────────────────────────────────────
 function MonthChart({ tasks }) {
-  const data = MONTHS.map((m,i)=>({
+  const data = MONTHS.map((m,i) => ({
     m,
-    impl: tasks.filter(t=>t.status==="Implemented" && monthOf(t.actual)===i).length,
-    pend: tasks.filter(t=>t.status!=="Implemented" && monthOf(t.target)===i).length,
+    impl: tasks.filter(t => t.status==="Implemented" && monthOf(t.actual)===i).length,
+    pend: tasks.filter(t => t.status!=="Implemented" && monthOf(t.target)===i).length,
   }));
-  const max = Math.max(...data.map(d=>d.impl+d.pend),1);
+  const max = Math.max(...data.map(d => d.impl+d.pend), 1);
   return (
     <div style={{display:"flex",alignItems:"flex-end",gap:3,height:72,padding:"0 2px"}}>
-      {data.map(d=>{
-        const total=d.impl+d.pend;
+      {data.map(d => {
+        const total = d.impl+d.pend;
         return (
           <div key={d.m} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:1}}>
-            {total>0
-              ? <span style={{fontSize:7,color:"#94a3b8",fontWeight:700,marginBottom:1,lineHeight:1}}>{total}</span>
-              : <span style={{fontSize:7,color:"transparent",marginBottom:1,lineHeight:1}}>0</span>
-            }
+            <span style={{fontSize:7,color:total>0?"#94a3b8":"transparent",fontWeight:700,marginBottom:1,lineHeight:1}}>{total||0}</span>
             <div style={{width:"100%",display:"flex",flexDirection:"column",justifyContent:"flex-end",height:46,gap:1}}>
-              {d.impl>0&&<div style={{width:"100%",height:`${(d.impl/max)*46}px`,background:"#22c55e",borderRadius:"2px 2px 0 0",minHeight:2}}/>}
-              {d.pend>0&&<div style={{width:"100%",height:`${(d.pend/max)*46}px`,background:"#f59e0b",borderRadius:d.impl?"0":"2px 2px 0 0",minHeight:2}}/>}
+              {d.impl>0 && <div style={{width:"100%",height:`${(d.impl/max)*46}px`,background:"#22c55e",borderRadius:"2px 2px 0 0",minHeight:2}}/>}
+              {d.pend>0 && <div style={{width:"100%",height:`${(d.pend/max)*46}px`,background:"#f59e0b",borderRadius:d.impl?"0":"2px 2px 0 0",minHeight:2}}/>}
             </div>
             <span style={{fontSize:7,color:"#334155"}}>{d.m}</span>
           </div>
@@ -112,19 +184,17 @@ function MonthChart({ tasks }) {
   );
 }
 
-// ─── Activity Chart — driven by passed tasks (live from sheet) ───────────────
+// ─── Activity Chart ───────────────────────────────────────────────────────────
 function ActivityChart({ tasks, activities }) {
-  // activities list derived from actual sheet data
-  const data = activities.map(a=>({
-    a: a.length>14?a.slice(0,13)+"…":a,
-    full: a,
-    impl: tasks.filter(t=>t.activity===a&&t.status==="Implemented").length,
-    pend: tasks.filter(t=>t.activity===a&&t.status!=="Implemented").length,
+  const data = activities.map(a => ({
+    a: a.length>14 ? a.slice(0,13)+"…" : a, full:a,
+    impl: tasks.filter(t => t.activity===a && t.status==="Implemented").length,
+    pend: tasks.filter(t => t.activity===a && t.status!=="Implemented").length,
   }));
-  const max = Math.max(...data.map(d=>d.impl+d.pend),1);
+  const max = Math.max(...data.map(d => d.impl+d.pend), 1);
   return (
     <div style={{display:"flex",flexDirection:"column",gap:6}}>
-      {data.map(d=>(
+      {data.map(d => (
         <div key={d.full}>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#64748b",marginBottom:2}}>
             <span title={d.full}>{d.a}</span>
@@ -141,7 +211,7 @@ function ActivityChart({ tasks, activities }) {
 }
 
 // ─── Spinner ──────────────────────────────────────────────────────────────────
-function Spinner({msg}) {
+function Spinner({ msg }) {
   return (
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
       height:"100vh",gap:16,background:"#060c18"}}>
@@ -153,49 +223,19 @@ function Spinner({msg}) {
   );
 }
 
-// ─── Setup Guide ──────────────────────────────────────────────────────────────
-function SetupGuide() {
-  return (
-    <div style={{minHeight:"100vh",background:"#060c18",color:"#e2e8f0",
-      fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
-      <div style={{maxWidth:600,background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:14,padding:32}}>
-        <h1 style={{fontSize:22,fontWeight:800,color:"#38bdf8",marginBottom:8}}>⚙ AUTOFLOW — SheetDB Setup</h1>
-        <p style={{color:"#94a3b8",marginBottom:24,lineHeight:1.7}}>
-          Connect your Google Sheet via SheetDB for full two-way sync. All engineers, commodities and activities are read live from your sheet — nothing is hardcoded.
-        </p>
-        {[
-          ["1","Create Google Sheet","Row 1 headers: partNo, partName, engineer, commodity, activity, priority, status, target, actual"],
-          ["2","Sign up at sheetdb.io","Create API → paste your Google Sheet edit URL → copy the API URL"],
-          ["3","Add to .env","VITE_SHEETDB_URL=https://sheetdb.io/api/v1/YOUR_API_ID"],
-          ["4","Deploy to Vercel","Settings → Environment Variables → add VITE_SHEETDB_URL → Redeploy"],
-        ].map(([n,t,d])=>(
-          <div key={n} style={{display:"flex",gap:14,marginBottom:18}}>
-            <div style={{width:26,height:26,borderRadius:"50%",background:"#38bdf8",color:"#060c18",
-              fontWeight:800,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{n}</div>
-            <div>
-              <div style={{fontWeight:700,color:"#e2e8f0",marginBottom:3}}>{t}</div>
-              <div style={{color:"#64748b",fontSize:12,lineHeight:1.6}}>{d}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 // ─── Add Task Modal ───────────────────────────────────────────────────────────
-function AddModal({ onClose, onSave, saving, engineers, commodities, activities }) {
-  const EMPTY = { partNo:"", partName:"", engineer:engineers[0]||"", commodity:commodities[0]||"",
-    activity:activities[0]||"", priority:"Medium", status:"Pending", target:"", actual:"" };
+function AddModal({ onClose, onSave, saving }) {
+  const EMPTY = { partNo:"", partName:"", engineer:"", commodity:"", activity:"",
+    priority:"Medium", status:"Pending", target:"", actual:"" };
   const [form, setForm] = useState(EMPTY);
-  const set = (k,v) => setForm(f=>({...f,[k]:v}));
+  const set = (k,v) => setForm(f => ({...f,[k]:v}));
   const inp = { width:"100%", background:"#0f2540", border:"1px solid #1e3a5f", borderRadius:8,
     padding:"7px 10px", color:"#e2e8f0", fontSize:12, outline:"none", boxSizing:"border-box" };
   const lbl = { display:"block", fontSize:10, fontWeight:700, color:"#64748b",
     marginBottom:3, letterSpacing:.8, textTransform:"uppercase" };
   return (
     <div style={{position:"fixed",inset:0,background:"#000b",zIndex:1000,display:"flex",
-      alignItems:"center",justifyContent:"center"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      alignItems:"center",justifyContent:"center"}} onClick={e => e.target===e.currentTarget && onClose()}>
       <div style={{background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:14,padding:24,
         width:500,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
@@ -203,28 +243,29 @@ function AddModal({ onClose, onSave, saving, engineers, commodities, activities 
           <button onClick={onClose} style={{background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:20}}>×</button>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-          <div><label style={lbl}>Part Number</label>
-            <input style={inp} value={form.partNo} onChange={e=>set("partNo",e.target.value)} placeholder="e.g. RBR-013"/></div>
-          <div><label style={lbl}>Part Name</label>
-            <input style={inp} value={form.partName} onChange={e=>set("partName",e.target.value)} placeholder="e.g. Exhaust Gasket"/></div>
-          {/* Dynamic dropdowns from sheet data */}
-          {[["Engineer","engineer",engineers],["Commodity","commodity",commodities],
-            ["Activity","activity",activities],["Priority","priority",PRIORITIES],["Status","status",STATUSES]].map(([l,k,opts])=>(
+          {[["Part Number","partNo","e.g. RBR-013"],["Part Name","partName","e.g. Exhaust Gasket"],
+            ["Engineer","engineer","Engineer name"],["Commodity","commodity","e.g. Fasteners"],
+            ["Activity","activity","e.g. PPAP"]].map(([l,k,ph]) => (
             <div key={k}><label style={lbl}>{l}</label>
-              <select style={{...inp,cursor:"pointer"}} value={form[k]} onChange={e=>set(k,e.target.value)}>
-                {opts.map(o=><option key={o}>{o}</option>)}
+              <input style={inp} value={form[k]} onChange={e => set(k,e.target.value)} placeholder={ph}/>
+            </div>
+          ))}
+          {[["Priority","priority",PRIORITIES],["Status","status",STATUSES]].map(([l,k,opts]) => (
+            <div key={k}><label style={lbl}>{l}</label>
+              <select style={{...inp,cursor:"pointer"}} value={form[k]} onChange={e => set(k,e.target.value)}>
+                {opts.map(o => <option key={o}>{o}</option>)}
               </select>
             </div>
           ))}
           <div><label style={lbl}>Target Date</label>
-            <input type="date" style={inp} value={form.target} onChange={e=>set("target",e.target.value)}/></div>
+            <input type="date" style={inp} value={form.target} onChange={e => set("target",e.target.value)}/></div>
           <div><label style={lbl}>Actual Date</label>
-            <input type="date" style={inp} value={form.actual} onChange={e=>set("actual",e.target.value)}/></div>
+            <input type="date" style={inp} value={form.actual} onChange={e => set("actual",e.target.value)}/></div>
         </div>
         <div style={{display:"flex",justifyContent:"flex-end",gap:10,marginTop:20}}>
           <button onClick={onClose} style={{background:"#1e3a5f",border:"none",borderRadius:8,
             padding:"7px 16px",color:"#94a3b8",cursor:"pointer",fontSize:12,fontWeight:600}}>Cancel</button>
-          <button onClick={()=>onSave(form)} disabled={saving||!form.partNo||!form.partName}
+          <button onClick={() => onSave(form)} disabled={saving||!form.partNo||!form.partName}
             style={{background:saving||!form.partNo||!form.partName?"#334155":"#38bdf8",
             border:"none",borderRadius:8,padding:"7px 16px",
             color:saving||!form.partNo||!form.partName?"#64748b":"#060c18",
@@ -237,11 +278,189 @@ function AddModal({ onClose, onSave, saving, engineers, commodities, activities 
   );
 }
 
+// ─── Import Modal ─────────────────────────────────────────────────────────────
+function ImportModal({ onClose, onImport, importing }) {
+  const [rows,    setRows]    = useState([]);      // parsed preview rows (app shape)
+  const [headers, setHeaders] = useState([]);      // original Excel headers
+  const [mapping, setMapping] = useState({});      // field → Excel header
+  const [fileName,setFileName]= useState("");
+  const [step,    setStep]    = useState("upload");// upload | map | preview
+  const [error,   setError]   = useState("");
+
+  const appFields = ["partNo","partName","engineer","commodity","activity","priority","status","target","actual"];
+  const fieldLabels = { partNo:"Part No", partName:"Part Name", engineer:"Engineer",
+    commodity:"Commodity", activity:"Activity", priority:"Priority",
+    status:"Status", target:"Target Date", actual:"Actual Date" };
+
+  const handleFile = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setError("");
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type:"array", cellDates:false });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(ws, { defval:"", raw:true });
+        if (!raw.length) { setError("Sheet is empty."); return; }
+        const hdrs = Object.keys(raw[0]);
+        setHeaders(hdrs);
+        setMapping(autoMap(hdrs));
+        setRows(raw);
+        setStep("map");
+      } catch(err) {
+        setError("Could not read file: "+err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  // Build preview from current mapping
+  const preview = useMemo(() => rows.slice(0,5).map(r => {
+    const obj = {};
+    appFields.forEach(f => {
+      const col = mapping[f];
+      let val = col ? String(r[col]||"").trim() : "";
+      if (f==="target"||f==="actual") val = normaliseDate(col ? r[col] : "");
+      obj[f] = val;
+    });
+    return obj;
+  }), [rows, mapping]);
+
+  const allRows = useMemo(() => rows.map(r => {
+    const obj = {};
+    appFields.forEach(f => {
+      const col = mapping[f];
+      let val = col ? String(r[col]||"").trim() : "";
+      if (f==="target"||f==="actual") val = normaliseDate(col ? r[col] : "");
+      obj[f] = val;
+    });
+    return obj;
+  }), [rows, mapping]);
+
+  const S = {
+    overlay: { position:"fixed",inset:0,background:"#000c",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center" },
+    box:     { background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:14,padding:28,width:700,maxWidth:"96vw",maxHeight:"92vh",overflowY:"auto" },
+    h2:      { fontSize:15,fontWeight:800,color:"#38bdf8",marginBottom:4 },
+    sub:     { fontSize:11,color:"#64748b",marginBottom:18 },
+    lbl:     { fontSize:10,fontWeight:700,color:"#64748b",marginBottom:3,letterSpacing:.8,textTransform:"uppercase",display:"block" },
+    sel:     { width:"100%",background:"#0f2540",border:"1px solid #1e3a5f",borderRadius:7,padding:"5px 8px",color:"#e2e8f0",fontSize:11,outline:"none" },
+    btnP:    { background:"#38bdf8",border:"none",borderRadius:8,padding:"7px 18px",color:"#060c18",fontSize:12,fontWeight:700,cursor:"pointer" },
+    btnG:    { background:"#1e3a5f",border:"none",borderRadius:8,padding:"7px 14px",color:"#94a3b8",fontSize:12,fontWeight:600,cursor:"pointer" },
+    th:      { textAlign:"left",padding:"6px 10px",fontSize:9,fontWeight:700,letterSpacing:1.5,color:"#64748b",textTransform:"uppercase",borderBottom:"1px solid #1e3a5f" },
+    td:      { padding:"5px 10px",fontSize:11,borderBottom:"1px solid #0f2540",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" },
+  };
+
+  return (
+    <div style={S.overlay} onClick={e => e.target===e.currentTarget && onClose()}>
+      <div style={S.box}>
+        {/* Header */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+          <div>
+            <div style={S.h2}>📥 Import from Excel / CSV</div>
+            <div style={S.sub}>
+              {step==="upload" && "Upload your .xlsx or .csv file to import tasks in bulk."}
+              {step==="map"    && `"${fileName}" — Map your columns to app fields, then preview.`}
+              {step==="preview"&& `Preview of first 5 rows from "${fileName}". ${rows.length} total rows will be imported.`}
+            </div>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:20,lineHeight:1}}>×</button>
+        </div>
+
+        {error && <div style={{background:"#ff444418",border:"1px solid #ff4444",borderRadius:8,padding:"8px 12px",color:"#ff8888",fontSize:12,marginBottom:14}}>{error}</div>}
+
+        {/* STEP 1 — Upload */}
+        {step==="upload" && (
+          <label style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+            border:"2px dashed #1e3a5f",borderRadius:12,padding:40,cursor:"pointer",gap:10,
+            background:"#0f1f38",transition:"border-color .2s"}}
+            onMouseEnter={e=>e.currentTarget.style.borderColor="#38bdf8"}
+            onMouseLeave={e=>e.currentTarget.style.borderColor="#1e3a5f"}>
+            <span style={{fontSize:36}}>📂</span>
+            <span style={{color:"#e2e8f0",fontWeight:700,fontSize:13}}>Click to choose file</span>
+            <span style={{color:"#64748b",fontSize:11}}>Supports .xlsx, .xls, .csv</span>
+            <input type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={handleFile}/>
+          </label>
+        )}
+
+        {/* STEP 2 — Column Mapping */}
+        {step==="map" && (
+          <>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:18}}>
+              {appFields.map(f => (
+                <div key={f}>
+                  <label style={S.lbl}>
+                    {fieldLabels[f]}
+                    {(f==="partNo"||f==="partName") && <span style={{color:"#ff4444"}}> *</span>}
+                  </label>
+                  <select style={S.sel} value={mapping[f]||""} onChange={e => setMapping(m => ({...m,[f]:e.target.value}))}>
+                    <option value="">— skip —</option>
+                    {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:11,color:"#64748b"}}>{rows.length} rows detected</span>
+              <div style={{display:"flex",gap:10}}>
+                <button style={S.btnG} onClick={() => setStep("upload")}>← Back</button>
+                <button style={S.btnP} onClick={() => setStep("preview")}
+                  disabled={!mapping.partNo && !mapping.partName}>
+                  Preview →
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* STEP 3 — Preview */}
+        {step==="preview" && (
+          <>
+            <div style={{overflowX:"auto",marginBottom:16}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                <thead>
+                  <tr>{appFields.map(f => <th key={f} style={S.th}>{fieldLabels[f]}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {preview.map((row,i) => (
+                    <tr key={i}>
+                      {appFields.map(f => (
+                        <td key={f} style={{...S.td,color:f==="partNo"?"#38bdf8":f==="status"?statusColor[row[f]]||"#e2e8f0":f==="priority"?priorityColor[row[f]]||"#e2e8f0":"#e2e8f0"}}>
+                          {row[f]||<span style={{color:"#334155"}}>—</span>}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {rows.length>5 && <div style={{fontSize:11,color:"#64748b",padding:"8px 10px"}}>… and {rows.length-5} more rows</div>}
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:11,color:"#64748b"}}>
+                <span style={{color:"#38bdf8",fontWeight:700}}>{rows.length}</span> rows will be saved to Supabase
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button style={S.btnG} onClick={() => setStep("map")}>← Edit Mapping</button>
+                <button style={{...S.btnP,background:importing?"#334155":"#22c55e",color:importing?"#64748b":"#060c18"}}
+                  onClick={() => onImport(allRows)} disabled={importing}>
+                  {importing ? "Importing…" : `✓ Import ${rows.length} Rows`}
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [tasks, setTasks]             = useState([]);
   const [loading, setLoading]         = useState(true);
   const [saving, setSaving]           = useState(false);
+  const [importing, setImporting]     = useState(false);
   const [error, setError]             = useState(null);
   const [lastFetched, setLastFetched] = useState(null);
   const [search, setSearch]           = useState("");
@@ -251,172 +470,193 @@ export default function App() {
   const [fStat, setFStat]             = useState("All");
   const [activeTab, setActiveTab]     = useState("table");
   const [showModal, setShowModal]     = useState(false);
+  const [showImport, setShowImport]   = useState(false);
   const [activeEng, setActiveEng]     = useState(null);
-  const timerRef = useRef(null);
+  const debounceRef = useRef({});
 
   // ── FETCH ─────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async (isManual=false) => {
-    if (!SHEETDB_URL) { setLoading(false); return; }
     if (isManual) setLoading(true);
     try {
-      const res = await fetch(SHEETDB_URL, { cache:"no-store" });
+      const res = await sbFetch(`${TABLE}?select=*&order=id.asc`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      const parsed = json.map((row,i)=>({
-        id:        row.partNo+"_"+i,
-        partNo:    (row.partNo    ||"").trim(),
-        partName:  (row.partName  ||"").trim(),
-        engineer:  (row.engineer  ||"").trim(),
-        commodity: (row.commodity ||"").trim(),
-        activity:  (row.activity  ||"").trim(),
-        priority:  (row.priority  ||"Medium").trim(),
-        status:    (row.status    ||"Pending").trim(),
-        target:    (row.target    ||"").trim(),
-        actual:    (row.actual    ||"").trim(),
-      })).filter(r=>r.partNo);
-      setTasks(parsed);
+      setTasks(json.map(parseRow).filter(r => r.partNo));
       setError(null);
       setLastFetched(new Date());
     } catch(e) {
       setError(`Refresh failed — showing last data. (${e.message})`);
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   }, []);
 
-  useEffect(() => {
-    fetchData();
-    timerRef.current = setInterval(()=>fetchData(), REFRESH_MS);
-    return ()=>clearInterval(timerRef.current);
-  }, [fetchData]);
+  useEffect(() => { fetchData(); }, [fetchData]);
 
-  // ── DYNAMIC LISTS — derived 100% from sheet data, update on every fetch ──
-  const engineers   = useMemo(()=>unique(tasks.map(t=>t.engineer)),   [tasks]);
-  const commodities = useMemo(()=>unique(tasks.map(t=>t.commodity)),  [tasks]);
-  const activities  = useMemo(()=>unique(tasks.map(t=>t.activity)),   [tasks]);
-  const statuses    = useMemo(()=>{
-    // keep fixed order but only show statuses that exist in data
-    const inData = unique(tasks.map(t=>t.status));
-    const ordered = STATUSES.filter(s=>inData.includes(s));
-    // add any new ones from sheet not in our fixed list
-    inData.forEach(s=>{ if(!ordered.includes(s)) ordered.push(s); });
+  // ── DERIVED LISTS ─────────────────────────────────────────────────────────
+  const engineers   = useMemo(() => unique(tasks.map(t => t.engineer)),  [tasks]);
+  const commodities = useMemo(() => unique(tasks.map(t => t.commodity)), [tasks]);
+  const activities  = useMemo(() => unique(tasks.map(t => t.activity)),  [tasks]);
+  const statuses    = useMemo(() => {
+    const inData = unique(tasks.map(t => t.status));
+    const ordered = STATUSES.filter(s => inData.includes(s));
+    inData.forEach(s => { if (!ordered.includes(s)) ordered.push(s); });
     return ordered;
   }, [tasks]);
 
-  // ── UPDATE ────────────────────────────────────────────────────────────────
-  const updateField = async (row, field, val) => {
-    setTasks(prev=>prev.map(t=>t.id===row.id?{...t,[field]:val}:t));
-    try {
-      await fetch(`${SHEETDB_URL}/partNo/${encodeURIComponent(row.partNo)}`, {
-        method:"PATCH", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({data:{[field]:val}}),
-      });
-    } catch(e) {
-      setError("Save failed — reverting.");
-      setTasks(prev=>prev.map(t=>t.id===row.id?{...t,[field]:row[field]}:t));
-    }
-  };
+  // ── UPDATE — debounced 600ms ──────────────────────────────────────────────
+  const updateField = useCallback((row, field, val) => {
+    setTasks(prev => prev.map(t => t.id===row.id ? {...t,[field]:val} : t));
+    const key = `${row.id}_${field}`;
+    clearTimeout(debounceRef.current[key]);
+    debounceRef.current[key] = setTimeout(async () => {
+      try {
+        const res = await sbFetch(`${TABLE}?id=eq.${row.id}`, {
+          method:"PATCH",
+          headers:{ Prefer:"return=minimal" },
+          body: JSON.stringify({ [toCol(field)]: val || null }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch(e) {
+        setError(`Save failed for ${field}.`);
+        setTasks(prev => prev.map(t => t.id===row.id ? {...t,[field]:row[field]} : t));
+      }
+    }, 600);
+  }, []);
 
   // ── ADD ───────────────────────────────────────────────────────────────────
   const addTask = async (form) => {
     setSaving(true);
     try {
-      const res = await fetch(SHEETDB_URL, {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({data:[form]}),
+      const res = await sbFetch(TABLE, {
+        method:"POST",
+        body: JSON.stringify({
+          part_no:   form.partNo,
+          part_name: form.partName,
+          engineer:  form.engineer,
+          commodity: form.commodity,
+          activity:  form.activity,
+          priority:  form.priority,
+          status:    form.status,
+          target:    form.target || null,
+          actual:    form.actual || null,
+        }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const err = await res.json().catch(()=>({}));
+        throw new Error(err.message || `HTTP ${res.status}`);
+      }
+      const [newRow] = await res.json();
+      setTasks(prev => [...prev, parseRow(newRow)]);
       setShowModal(false);
-      await fetchData(true);
     } catch(e) {
-      setError(`Failed to add: ${e.message}`);
+      setError(`Failed to add task: ${e.message}`);
     } finally { setSaving(false); }
   };
 
   // ── DELETE ────────────────────────────────────────────────────────────────
   const deleteRow = async (row) => {
     if (!window.confirm(`Delete ${row.partNo} — ${row.partName}?`)) return;
-    setTasks(prev=>prev.filter(t=>t.id!==row.id));
+    setTasks(prev => prev.filter(t => t.id!==row.id));
     try {
-      await fetch(`${SHEETDB_URL}/partNo/${encodeURIComponent(row.partNo)}`,{method:"DELETE"});
-    } catch(e) { setError("Delete failed — refreshing."); fetchData(); }
+      await sbFetch(`${TABLE}?id=eq.${row.id}`, { method:"DELETE", headers:{ Prefer:"return=minimal" } });
+    } catch(e) {
+      setError("Delete failed — restoring.");
+      fetchData();
+    }
   };
 
-  // ──────────────────────────────────────────────────────────────────────────
-  // DATA SLICES
-  // ──────────────────────────────────────────────────────────────────────────
+  // ── IMPORT ────────────────────────────────────────────────────────────────
+  const handleImport = async (rows) => {
+    setImporting(true);
+    try {
+      // Supabase allows bulk insert in one POST
+      const payload = rows.map(r => ({
+        part_no:   r.partNo   || null,
+        part_name: r.partName || null,
+        engineer:  r.engineer || null,
+        commodity: r.commodity|| null,
+        activity:  r.activity || null,
+        priority:  PRIORITIES.includes(r.priority) ? r.priority : "Medium",
+        status:    STATUSES.includes(r.status)     ? r.status   : "Pending",
+        target:    r.target   || null,
+        actual:    r.actual   || null,
+      })).filter(r => r.part_no || r.part_name);
 
-  // Table/Gantt — header dropdown filters
-  const filteredRows = useMemo(()=>tasks.filter(t=>{
-    const q=search.toLowerCase();
-    if(q&&!t.partNo.toLowerCase().includes(q)&&!t.partName.toLowerCase().includes(q)) return false;
-    if(fEng!=="All"&&t.engineer!==fEng)   return false;
-    if(fCom!=="All"&&t.commodity!==fCom)  return false;
-    if(fAct!=="All"&&t.activity!==fAct)   return false;
-    if(fStat!=="All"&&t.status!==fStat)   return false;
+      const CHUNK = 50; // Supabase handles bulk fine; chunk for safety
+      const inserted = [];
+      for (let i=0; i<payload.length; i+=CHUNK) {
+        const chunk = payload.slice(i, i+CHUNK);
+        const res = await sbFetch(TABLE, {
+          method:"POST",
+          body: JSON.stringify(chunk),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(()=>({}));
+          throw new Error(err.message || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        inserted.push(...data);
+      }
+      setTasks(prev => [...prev, ...inserted.map(parseRow)]);
+      setShowImport(false);
+      setError(null);
+    } catch(e) {
+      setError(`Import failed: ${e.message}`);
+    } finally { setImporting(false); }
+  };
+
+  // ── DATA SLICES ───────────────────────────────────────────────────────────
+  const filteredRows = useMemo(() => tasks.filter(t => {
+    const q = search.toLowerCase();
+    if (q && !t.partNo.toLowerCase().includes(q) && !t.partName.toLowerCase().includes(q)) return false;
+    if (fEng !=="All" && t.engineer  !==fEng)  return false;
+    if (fCom !=="All" && t.commodity !==fCom)  return false;
+    if (fAct !=="All" && t.activity  !==fAct)  return false;
+    if (fStat!=="All" && t.status    !==fStat) return false;
     return true;
-  }),[tasks,search,fEng,fCom,fAct,fStat]);
+  }), [tasks,search,fEng,fCom,fAct,fStat]);
 
-  // Left panel charts — engineer click filter
-  const engTasks = useMemo(()=>
-    activeEng ? tasks.filter(t=>t.engineer===activeEng) : tasks,
-  [tasks,activeEng]);
+  const engTasks   = useMemo(() => activeEng ? tasks.filter(t => t.engineer===activeEng) : tasks, [tasks,activeEng]);
+  const engBarData = useMemo(() => engineers.map(e => ({
+    name:e, color:getEngColor(e,engineers),
+    impl:  tasks.filter(t => t.engineer===e && t.status==="Implemented").length,
+    pend:  tasks.filter(t => t.engineer===e && t.status!=="Implemented").length,
+    total: tasks.filter(t => t.engineer===e).length,
+  })), [tasks,engineers]);
 
-  // Engineer bar — always ALL tasks (never filtered)
-  const engBarData = useMemo(()=>engineers.map(e=>({
-    name:e,
-    color: getEngColor(e, engineers),
-    impl:  tasks.filter(t=>t.engineer===e&&t.status==="Implemented").length,
-    pend:  tasks.filter(t=>t.engineer===e&&t.status!=="Implemented").length,
-    total: tasks.filter(t=>t.engineer===e).length,
-  })),[tasks,engineers]);
-
-  // Commodity Matrix — always ALL tasks, static
-  const matrix = useMemo(()=>commodities.map(c=>({
+  const matrix = useMemo(() => commodities.map(c => ({
     name:c,
-    cols: activities.map(a=>({
+    cols: activities.map(a => ({
       name:a,
-      impl: tasks.filter(t=>t.commodity===c&&t.activity===a&&t.status==="Implemented").length,
-      pend: tasks.filter(t=>t.commodity===c&&t.activity===a&&t.status!=="Implemented").length,
+      impl: tasks.filter(t => t.commodity===c && t.activity===a && t.status==="Implemented").length,
+      pend: tasks.filter(t => t.commodity===c && t.activity===a && t.status!=="Implemented").length,
     })),
-  })),[tasks,commodities,activities]);
+  })), [tasks,commodities,activities]);
 
-  // KPIs — engTasks
   const total     = engTasks.length;
-  const implCount = engTasks.filter(t=>t.status==="Implemented").length;
-  const implRate  = total?Math.round((implCount/total)*100):0;
+  const implCount = engTasks.filter(t => t.status==="Implemented").length;
+  const implRate  = total ? Math.round((implCount/total)*100) : 0;
 
-  // Donut — engTasks, only statuses present in engTasks
-  const donutData = useMemo(()=>{
-    const inData = unique(engTasks.map(t=>t.status));
-    const ordered = STATUSES.filter(s=>inData.includes(s));
-    inData.forEach(s=>{if(!ordered.includes(s))ordered.push(s);});
-    return ordered.map(s=>({
-      label:s, v:engTasks.filter(t=>t.status===s).length,
-      color: statusColor[s]||"#64748b"
-    }));
-  },[engTasks]);
+  const donutData = useMemo(() => {
+    const inData = unique(engTasks.map(t => t.status));
+    const ordered = STATUSES.filter(s => inData.includes(s));
+    inData.forEach(s => { if (!ordered.includes(s)) ordered.push(s); });
+    return ordered.map(s => ({ label:s, v:engTasks.filter(t => t.status===s).length, color:statusColor[s]||"#64748b" }));
+  }, [engTasks]);
 
-  // Priority counts — engTasks
-  const priCount = useMemo(()=>{
-    const inData = unique(engTasks.map(t=>t.priority));
-    const ordered = PRIORITIES.filter(p=>inData.includes(p));
-    inData.forEach(p=>{if(!ordered.includes(p))ordered.push(p);});
-    return ordered.map(p=>({
-      label:p, v:engTasks.filter(t=>t.priority===p).length,
-      color: priorityColor[p]||"#94a3b8"
-    }));
-  },[engTasks]);
+  const priCount = useMemo(() => {
+    const inData = unique(engTasks.map(t => t.priority));
+    const ordered = PRIORITIES.filter(p => inData.includes(p));
+    inData.forEach(p => { if (!ordered.includes(p)) ordered.push(p); });
+    return ordered.map(p => ({ label:p, v:engTasks.filter(t => t.priority===p).length, color:priorityColor[p]||"#94a3b8" }));
+  }, [engTasks]);
 
-  // Urgency sidebar — always all tasks
-  const sidebarItems = useMemo(()=>
-    tasks.filter(t=>t.status!=="Implemented")
-      .map(t=>({...t,urg:urgencyOf(t),days:daysFrom(t.target)}))
-      .sort((a,b)=>({overdue:0,critical:1,warning:2,ok:3,none:4}[a.urg]-{overdue:0,critical:1,warning:2,ok:3,none:4}[b.urg])),
+  const sidebarItems = useMemo(() =>
+    tasks.filter(t => t.status!=="Implemented")
+      .map(t => ({...t, urg:urgencyOf(t), days:daysFrom(t.target)}))
+      .sort((a,b) => ({overdue:0,critical:1,warning:2,ok:3,none:4}[a.urg] - {overdue:0,critical:1,warning:2,ok:3,none:4}[b.urg])),
   [tasks]);
 
-  if (!SHEETDB_URL) return <SetupGuide />;
-  if (loading && tasks.length===0) return <Spinner msg="Loading from Google Sheet via SheetDB…" />;
+  if (loading && tasks.length===0) return <Spinner msg="Connecting to Supabase…" />;
 
   // ── Styles ────────────────────────────────────────────────────────────────
   const S = {
@@ -428,6 +668,7 @@ export default function App() {
     sel:  { background:"#0f2540", border:"1px solid #1e3a5f", borderRadius:8, padding:"6px 8px", color:"#e2e8f0", fontSize:12, outline:"none", cursor:"pointer" },
     btnP: { background:"#38bdf8", border:"none", borderRadius:8, padding:"6px 13px", color:"#060c18", fontSize:12, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap" },
     btnG: { background:"#1e3a5f", border:"none", borderRadius:8, padding:"6px 12px", color:"#94a3b8", fontSize:12, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" },
+    btnI: { background:"#a78bfa22", border:"1px solid #a78bfa66", borderRadius:8, padding:"6px 12px", color:"#a78bfa", fontSize:12, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" },
     body: { display:"flex", height:"calc(100vh - 54px)", overflow:"hidden" },
     left: { width:215, minWidth:200, background:"#0a1628", borderRight:"1px solid #1e3a5f", overflowY:"auto", padding:11, display:"flex", flexDirection:"column", gap:10 },
     ctr:  { flex:1, overflowY:"auto", padding:13, display:"flex", flexDirection:"column", gap:11 },
@@ -435,13 +676,13 @@ export default function App() {
     card: { background:"#0f1f38", border:"1px solid #1e3a5f", borderRadius:10, padding:11 },
     cT:   { fontSize:9, fontWeight:700, letterSpacing:2, color:"#64748b", textTransform:"uppercase", marginBottom:7 },
     tabB: { display:"flex", gap:2, borderBottom:"1px solid #1e3a5f" },
-    tab:  a=>({ padding:"7px 14px", background:"none", border:"none", borderBottom:a?"2px solid #38bdf8":"2px solid transparent", color:a?"#38bdf8":"#64748b", fontWeight:a?700:400, cursor:"pointer", fontSize:12, marginBottom:-1 }),
+    tab:  a => ({ padding:"7px 14px", background:"none", border:"none", borderBottom:a?"2px solid #38bdf8":"2px solid transparent", color:a?"#38bdf8":"#64748b", fontWeight:a?700:400, cursor:"pointer", fontSize:12, marginBottom:-1 }),
     tbl:  { width:"100%", borderCollapse:"collapse", fontSize:11 },
     th:   { textAlign:"left", padding:"7px 9px", fontSize:9, fontWeight:700, letterSpacing:1.5, color:"#64748b", textTransform:"uppercase", borderBottom:"1px solid #1e3a5f", whiteSpace:"nowrap" },
     td:   { padding:"6px 9px", borderBottom:"1px solid #0f2540", verticalAlign:"middle" },
     barW: { background:"#1e293b", borderRadius:3, height:5, overflow:"hidden", marginTop:3 },
-    bar:  (p,c)=>({ width:`${Math.min(p,100)}%`, height:"100%", background:c, borderRadius:3, transition:"width .5s" }),
-    iSel: c=>({ background:`${c}18`, border:`1px solid ${c}`, borderRadius:6, padding:"2px 7px", color:c, fontSize:10, cursor:"pointer", outline:"none", fontWeight:600 }),
+    bar:  (p,c) => ({ width:`${Math.min(p,100)}%`, height:"100%", background:c, borderRadius:3, transition:"width .5s" }),
+    iSel: c => ({ background:`${c}18`, border:`1px solid ${c}`, borderRadius:6, padding:"2px 7px", color:c, fontSize:10, cursor:"pointer", outline:"none", fontWeight:600 }),
     iTxt: { background:"#0a1628", border:"1px solid transparent", borderRadius:6, padding:"2px 6px", color:"#38bdf8", fontSize:11, outline:"none", width:"100%", minWidth:60, fontFamily:"inherit", transition:"border-color .15s", cursor:"text" },
   };
 
@@ -451,36 +692,39 @@ export default function App() {
       <div style={S.hdr}>
         <span style={S.logo}>⚙ AUTOFLOW</span>
         <div style={S.srchW}>
-          <svg style={{position:"absolute",left:8,top:"50%",transform:"translateY(-50%)",opacity:.4}} width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-          <input style={S.srch} placeholder="Search Part # or Name…" value={search} onChange={e=>setSearch(e.target.value)}/>
+          <svg style={{position:"absolute",left:8,top:"50%",transform:"translateY(-50%)",opacity:.4}}
+            width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input style={S.srch} placeholder="Search Part # or Name…" value={search} onChange={e => setSearch(e.target.value)}/>
         </div>
-        {/* All dropdowns populated from live sheet data */}
-        <select style={S.sel} value={fEng} onChange={e=>setFEng(e.target.value)}>
+        <select style={S.sel} value={fEng}  onChange={e => setFEng(e.target.value)}>
           <option value="All">All Engineers</option>
-          {engineers.map(x=><option key={x}>{x}</option>)}
+          {engineers.map(x => <option key={x}>{x}</option>)}
         </select>
-        <select style={S.sel} value={fCom} onChange={e=>setFCom(e.target.value)}>
+        <select style={S.sel} value={fCom}  onChange={e => setFCom(e.target.value)}>
           <option value="All">All Commodities</option>
-          {commodities.map(x=><option key={x}>{x}</option>)}
+          {commodities.map(x => <option key={x}>{x}</option>)}
         </select>
-        <select style={S.sel} value={fAct} onChange={e=>setFAct(e.target.value)}>
+        <select style={S.sel} value={fAct}  onChange={e => setFAct(e.target.value)}>
           <option value="All">All Activities</option>
-          {activities.map(x=><option key={x}>{x}</option>)}
+          {activities.map(x => <option key={x}>{x}</option>)}
         </select>
-        <select style={S.sel} value={fStat} onChange={e=>setFStat(e.target.value)}>
+        <select style={S.sel} value={fStat} onChange={e => setFStat(e.target.value)}>
           <option value="All">All Statuses</option>
-          {statuses.map(x=><option key={x}>{x}</option>)}
+          {statuses.map(x => <option key={x}>{x}</option>)}
         </select>
-        <button style={S.btnG} onClick={()=>{setSearch("");setFEng("All");setFCom("All");setFAct("All");setFStat("All");setActiveEng(null);}}>↺ Reset</button>
-        <button style={S.btnP} onClick={()=>setShowModal(true)}>+ Add Task</button>
-        <button style={S.btnG} onClick={()=>fetchData(true)}>{loading?"…":"⟳"}</button>
-        {lastFetched&&<span style={{fontSize:10,color:"#334155"}}>Updated {lastFetched.toLocaleTimeString()}</span>}
+        <button style={S.btnG} onClick={() => { setSearch(""); setFEng("All"); setFCom("All"); setFAct("All"); setFStat("All"); setActiveEng(null); }}>↺ Reset</button>
+        <button style={S.btnP} onClick={() => setShowModal(true)}>+ Add Task</button>
+        <button style={S.btnI} onClick={() => setShowImport(true)}>📥 Import</button>
+        <button style={S.btnG} onClick={() => fetchData(true)}>{loading?"…":"⟳"}</button>
+        {lastFetched && <span style={{fontSize:10,color:"#334155"}}>Updated {lastFetched.toLocaleTimeString()}</span>}
       </div>
 
-      {error&&(
+      {error && (
         <div style={{background:"#ff444412",borderBottom:"1px solid #ff444433",padding:"7px 16px",display:"flex",justifyContent:"space-between"}}>
           <span style={{color:"#ff8888",fontSize:12}}>⚠ {error}</span>
-          <button onClick={()=>setError(null)} style={{background:"none",border:"none",color:"#ff4444",cursor:"pointer",fontSize:16}}>×</button>
+          <button onClick={() => setError(null)} style={{background:"none",border:"none",color:"#ff4444",cursor:"pointer",fontSize:16}}>×</button>
         </div>
       )}
 
@@ -488,9 +732,8 @@ export default function App() {
 
         {/* LEFT PANEL */}
         <div style={S.left}>
-
           <div style={S.card}>
-            <div style={S.cT}>{activeEng?`${activeEng}'s Tasks`:"All Tasks"}</div>
+            <div style={S.cT}>{activeEng ? `${activeEng}'s Tasks` : "All Tasks"}</div>
             <div style={{fontSize:24,fontWeight:800,color:"#38bdf8",lineHeight:1}}>
               {implCount}<span style={{color:"#334155",fontSize:15}}>/{total}</span>
             </div>
@@ -515,13 +758,12 @@ export default function App() {
             </div>
           </div>
 
-          {/* Priority — only priorities present in sheet */}
           <div style={S.card}>
-            <div style={S.cT}>Priority {activeEng&&<span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
-            {priCount.map(p=>(
+            <div style={S.cT}>Priority {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
+            {priCount.map(p => (
               <div key={p.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
                 <span style={{display:"flex",alignItems:"center",gap:5}}>
-                  {p.label==="Critical"&&<span style={{width:6,height:6,borderRadius:"50%",background:"#ff4444",display:"inline-block",animation:"pulse 1s infinite"}}/>}
+                  {p.label==="Critical" && <span style={{width:6,height:6,borderRadius:"50%",background:"#ff4444",display:"inline-block",animation:"pulse 1s infinite"}}/>}
                   <span style={{color:"#94a3b8",fontSize:11}}>{p.label}</span>
                 </span>
                 <span style={{fontWeight:700,color:p.color,fontSize:12}}>{p.v}</span>
@@ -529,12 +771,11 @@ export default function App() {
             ))}
           </div>
 
-          {/* Donut — only statuses present in sheet */}
           <div style={{...S.card,display:"flex",flexDirection:"column",alignItems:"center"}}>
-            <div style={S.cT}>Status Split {activeEng&&<span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
+            <div style={S.cT}>Status Split {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
             <Donut data={donutData}/>
             <div style={{width:"100%",marginTop:5}}>
-              {donutData.map(d=>(
+              {donutData.map(d => (
                 <div key={d.label} style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
                   <span style={{display:"flex",alignItems:"center",gap:5}}>
                     <span style={{width:7,height:7,borderRadius:2,background:d.color,display:"inline-block"}}/>
@@ -546,20 +787,18 @@ export default function App() {
             </div>
           </div>
 
-          {/* Engineer bar — ALWAYS all tasks, engineers from sheet */}
           <div style={S.card}>
-            <div style={S.cT}>By Engineer <span style={{color:"#38bdf855",fontSize:8,textTransform:"none"}}>(click to filter charts)</span></div>
-            {engBarData.map(e=>(
+            <div style={S.cT}>By Engineer <span style={{color:"#38bdf855",fontSize:8,textTransform:"none"}}>(click to filter)</span></div>
+            {engBarData.map(e => (
               <HBar key={e.name} label={e.name} impl={e.impl} pend={e.pend} total={e.total}
                 color={e.color} active={activeEng===e.name}
-                onClick={()=>setActiveEng(activeEng===e.name?null:e.name)}/>
+                onClick={() => setActiveEng(activeEng===e.name ? null : e.name)}/>
             ))}
-            {activeEng&&<div style={{fontSize:9,color:"#38bdf8",marginTop:4,cursor:"pointer",textAlign:"center"}} onClick={()=>setActiveEng(null)}>× Clear filter</div>}
+            {activeEng && <div style={{fontSize:9,color:"#38bdf8",marginTop:4,cursor:"pointer",textAlign:"center"}} onClick={() => setActiveEng(null)}>× Clear filter</div>}
           </div>
 
-          {/* Monthly chart — engTasks */}
           <div style={S.card}>
-            <div style={S.cT}>Monthly {activeEng&&<span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
+            <div style={S.cT}>Monthly {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
             <MonthChart tasks={engTasks}/>
             <div style={{display:"flex",gap:10,marginTop:4,justifyContent:"center"}}>
               <span style={{fontSize:9,color:"#22c55e"}}>▮ Implemented</span>
@@ -567,105 +806,62 @@ export default function App() {
             </div>
           </div>
 
-          {/* Activity chart — engTasks, activities from sheet */}
           <div style={S.card}>
-            <div style={S.cT}>By Activity {activeEng&&<span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
+            <div style={S.cT}>By Activity {activeEng && <span style={{color:"#38bdf855"}}>· {activeEng}</span>}</div>
             <ActivityChart tasks={engTasks} activities={activities}/>
           </div>
-
         </div>
 
         {/* CENTER */}
         <div style={S.ctr}>
           <div style={S.tabB}>
-            {[["table","Tracking Table"],["matrix","Commodity Matrix (Static)"],["gantt","Timeline / Gantt"]].map(([k,l])=>(
-              <button key={k} style={S.tab(activeTab===k)} onClick={()=>setActiveTab(k)}>{l}</button>
+            {[["table","Tracking Table"],["matrix","Commodity Matrix"],["gantt","Timeline / Gantt"]].map(([k,l]) => (
+              <button key={k} style={S.tab(activeTab===k)} onClick={() => setActiveTab(k)}>{l}</button>
             ))}
           </div>
 
           {/* TRACKING TABLE */}
-          {activeTab==="table"&&(
+          {activeTab==="table" && (
             <div style={{...S.card,padding:0,overflowX:"auto"}}>
               <table style={S.tbl}>
                 <thead>
-                  <tr>{["Part #","Part Name","Engineer","Commodity","Activity","Priority","Status","Target","Overdue Days","Delete"].map(h=>(
+                  <tr>{["Part #","Part Name","Engineer","Commodity","Activity","Priority","Status","Target","Overdue Days","Delete"].map(h => (
                     <th key={h} style={S.th}>{h}</th>
                   ))}</tr>
                 </thead>
                 <tbody>
-                  {filteredRows.map(row=>{
-                    const urg=urgencyOf(row),days=daysFrom(row.target);
+                  {filteredRows.map(row => {
+                    const urg = urgencyOf(row), days = daysFrom(row.target);
                     return (
                       <tr key={row.id} style={{background:urg==="overdue"||urg==="critical"?"#ff44440a":"transparent"}}>
-                        {/* Part # — inline editable */}
+                        <td style={S.td}><input style={S.iTxt} value={row.partNo}    onChange={e => updateField(row,"partNo",e.target.value)}/></td>
+                        <td style={{...S.td,maxWidth:150}}><input style={{...S.iTxt,minWidth:90}} value={row.partName}  onChange={e => updateField(row,"partName",e.target.value)}/></td>
+                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.engineer}  onChange={e => updateField(row,"engineer",e.target.value)}/></td>
+                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.commodity} onChange={e => updateField(row,"commodity",e.target.value)}/></td>
+                        <td style={S.td}><input style={{...S.iTxt,minWidth:80}} value={row.activity}  onChange={e => updateField(row,"activity",e.target.value)}/></td>
                         <td style={S.td}>
-                          <input style={S.iTxt} value={row.partNo}
-                            onChange={e=>setTasks(prev=>prev.map(t=>t.id===row.id?{...t,partNo:e.target.value}:t))}
-                            onBlur={e=>updateField(row,"partNo",e.target.value)}/>
-                        </td>
-                        {/* Part Name */}
-                        <td style={{...S.td,maxWidth:150}}>
-                          <input style={{...S.iTxt,width:"100%",minWidth:90}} value={row.partName}
-                            onChange={e=>setTasks(prev=>prev.map(t=>t.id===row.id?{...t,partName:e.target.value}:t))}
-                            onBlur={e=>updateField(row,"partName",e.target.value)}/>
-                        </td>
-                        {/* Engineer */}
-                        <td style={S.td}>
-                          <input style={{...S.iTxt,minWidth:80}} value={row.engineer}
-                            onChange={e=>setTasks(prev=>prev.map(t=>t.id===row.id?{...t,engineer:e.target.value}:t))}
-                            onBlur={e=>updateField(row,"engineer",e.target.value)}/>
-                        </td>
-                        {/* Commodity */}
-                        <td style={{...S.td,fontSize:10}}>
-                          <select style={S.iSel("#94a3b8")} value={row.commodity}
-                            onChange={e=>updateField(row,"commodity",e.target.value)}>
-                            {commodities.map(c=><option key={c}>{c}</option>)}
+                          <select style={S.iSel(priorityColor[row.priority]||"#94a3b8")} value={row.priority} onChange={e => updateField(row,"priority",e.target.value)}>
+                            {PRIORITIES.map(p => <option key={p}>{p}</option>)}
                           </select>
                         </td>
-                        {/* Activity */}
-                        <td style={{...S.td,fontSize:10}}>
-                          <select style={S.iSel("#94a3b8")} value={row.activity}
-                            onChange={e=>updateField(row,"activity",e.target.value)}>
-                            {activities.map(a=><option key={a}>{a}</option>)}
+                        <td style={S.td}>
+                          <select style={S.iSel(statusColor[row.status]||"#94a3b8")} value={row.status} onChange={e => updateField(row,"status",e.target.value)}>
+                            {STATUSES.map(s => <option key={s}>{s}</option>)}
                           </select>
                         </td>
-                        {/* Priority */}
                         <td style={S.td}>
-                          <select style={S.iSel(priorityColor[row.priority]||"#94a3b8")}
-                            value={row.priority} onChange={e=>updateField(row,"priority",e.target.value)}>
-                            {PRIORITIES.map(p=><option key={p}>{p}</option>)}
-                          </select>
+                          <input type="date" style={{...S.iTxt,fontSize:10,color:"#94a3b8",minWidth:110}} value={row.target} onChange={e => updateField(row,"target",e.target.value)}/>
                         </td>
-                        {/* Status */}
-                        <td style={S.td}>
-                          <select style={S.iSel(statusColor[row.status]||"#94a3b8")}
-                            value={row.status} onChange={e=>updateField(row,"status",e.target.value)}>
-                            {STATUSES.map(s=><option key={s}>{s}</option>)}
-                          </select>
-                        </td>
-                        {/* Target Date */}
-                        <td style={S.td}>
-                          <input type="date" style={{...S.iTxt,fontSize:10,color:"#94a3b8",minWidth:110}} value={row.target}
-                            onChange={e=>{
-                              const val=e.target.value;
-                              setTasks(prev=>prev.map(t=>t.id===row.id?{...t,target:val}:t));
-                              if(val) updateField(row,"target",val);
-                            }}/>
-                        </td>
-                        {/* Overdue Days */}
                         <td style={{...S.td,fontWeight:700,fontSize:11,whiteSpace:"nowrap",
                           color:days===null?"#64748b":days<0?"#ff4444":days<7?"#ff8800":days<15?"#f5c518":"#22c55e"}}>
-                          {days===null?"—":days<0?`${Math.abs(days)}`:`${days}`}
+                          {days===null?"—":Math.abs(days)}
                         </td>
-                        {/* Delete */}
                         <td style={{...S.td,textAlign:"center"}}>
-                          <button onClick={()=>deleteRow(row)}
-                            title="Delete task"
+                          <button onClick={() => deleteRow(row)} title="Delete task"
                             style={{background:"#ff444418",border:"1px solid #ff444444",color:"#ff6666",
-                              cursor:"pointer",fontSize:13,padding:"3px 7px",borderRadius:6,
-                              lineHeight:1,transition:"all .15s"}}
-                            onMouseEnter={e=>{e.currentTarget.style.background="#ff444433";e.currentTarget.style.borderColor="#ff4444";}}
-                            onMouseLeave={e=>{e.currentTarget.style.background="#ff444418";e.currentTarget.style.borderColor="#ff444444";}}>
+                              cursor:"pointer",fontSize:13,padding:"3px 7px",borderRadius:6,lineHeight:1,transition:"all .15s"}}
+                            onMouseEnter={e => { e.currentTarget.style.background="#ff444433"; e.currentTarget.style.borderColor="#ff4444"; }}
+                            onMouseLeave={e => { e.currentTarget.style.background="#ff444418"; e.currentTarget.style.borderColor="#ff444444"; }}>
                             🗑
                           </button>
                         </td>
@@ -674,39 +870,39 @@ export default function App() {
                   })}
                 </tbody>
               </table>
-              {filteredRows.length===0&&<div style={{padding:24,textAlign:"center",color:"#64748b"}}>No tasks match the current filters.</div>}
+              {filteredRows.length===0 && <div style={{padding:24,textAlign:"center",color:"#64748b"}}>No tasks match the current filters.</div>}
             </div>
           )}
 
-          {/* COMMODITY MATRIX — always all tasks, all commodities/activities from sheet */}
-          {activeTab==="matrix"&&(
+          {/* COMMODITY MATRIX */}
+          {activeTab==="matrix" && (
             <div style={{...S.card,padding:0,overflowX:"auto"}}>
               <div style={{padding:"8px 14px 0",fontSize:9,color:"#64748b",letterSpacing:1,textTransform:"uppercase",fontWeight:700}}>
-                All Engineers · All Data · Static — <span style={{color:"#334155",textTransform:"none",letterSpacing:0}}>not affected by filters</span>
+                All Engineers · All Data · <span style={{color:"#334155",textTransform:"none",letterSpacing:0}}>not affected by filters</span>
               </div>
               <table style={{...S.tbl,fontSize:10,marginTop:4}}>
                 <thead>
                   <tr>
                     <th style={{...S.th,padding:"8px 14px"}}>Commodity ╲ Activity</th>
-                    {activities.map(a=><th key={a} style={{...S.th,textAlign:"center"}}>{a}</th>)}
+                    {activities.map(a => <th key={a} style={{...S.th,textAlign:"center"}}>{a}</th>)}
                     <th style={{...S.th,textAlign:"center"}}>Total</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {matrix.map(row=>{
-                    const rT=row.cols.reduce((a,c)=>a+c.impl+c.pend,0);
-                    const rI=row.cols.reduce((a,c)=>a+c.impl,0);
+                  {matrix.map(row => {
+                    const rT = row.cols.reduce((a,c) => a+c.impl+c.pend, 0);
+                    const rI = row.cols.reduce((a,c) => a+c.impl, 0);
                     return (
                       <tr key={row.name}>
                         <td style={{...S.td,fontWeight:600,color:"#38bdf8",whiteSpace:"nowrap",padding:"8px 14px"}}>{row.name}</td>
-                        {row.cols.map(c=>(
+                        {row.cols.map(c => (
                           <td key={c.name} style={{...S.td,textAlign:"center",padding:5}}>
                             {c.impl+c.pend===0
-                              ?<span style={{color:"#334155"}}>—</span>
-                              :<div style={{display:"flex",flexDirection:"column",gap:2,alignItems:"center"}}>
-                                {c.impl>0&&<span style={{background:"#22c55e22",border:"1px solid #22c55e",borderRadius:4,padding:"1px 6px",color:"#22c55e"}}>✓{c.impl}</span>}
-                                {c.pend>0&&<span style={{background:"#f59e0b22",border:"1px solid #f59e0b",borderRadius:4,padding:"1px 6px",color:"#f59e0b"}}>◷{c.pend}</span>}
-                              </div>
+                              ? <span style={{color:"#334155"}}>—</span>
+                              : <div style={{display:"flex",flexDirection:"column",gap:2,alignItems:"center"}}>
+                                  {c.impl>0 && <span style={{background:"#22c55e22",border:"1px solid #22c55e",borderRadius:4,padding:"1px 6px",color:"#22c55e"}}>✓{c.impl}</span>}
+                                  {c.pend>0 && <span style={{background:"#f59e0b22",border:"1px solid #f59e0b",borderRadius:4,padding:"1px 6px",color:"#f59e0b"}}>◷{c.pend}</span>}
+                                </div>
                             }
                           </td>
                         ))}
@@ -720,14 +916,14 @@ export default function App() {
           )}
 
           {/* GANTT */}
-          {activeTab==="gantt"&&(
+          {activeTab==="gantt" && (
             <div style={S.card}>
               <div style={S.cT}>Timeline — Elapsed Progress</div>
-              {filteredRows.map(row=>{
-                const start=new Date("2025-01-01"),end=row.target?new Date(row.target):new Date("2025-12-31");
-                const elapsed=Math.min(Math.max((today-start)/Math.max(end-start,1),0),1);
-                const urg=urgencyOf(row);
-                const bc=urg==="overdue"||urg==="critical"?"#ff4444":urg==="warning"?"#f5c518":"#22c55e";
+              {filteredRows.map(row => {
+                const start = new Date("2025-01-01"), end = row.target ? new Date(row.target) : new Date("2025-12-31");
+                const elapsed = Math.min(Math.max((today-start)/Math.max(end-start,1),0),1);
+                const urg = urgencyOf(row);
+                const bc = urg==="overdue"||urg==="critical"?"#ff4444":urg==="warning"?"#f5c518":"#22c55e";
                 return (
                   <div key={row.id} style={{marginBottom:9}}>
                     <div style={{display:"flex",justifyContent:"space-between",marginBottom:2,fontSize:10}}>
@@ -741,7 +937,7 @@ export default function App() {
                   </div>
                 );
               })}
-              {filteredRows.length===0&&<div style={{color:"#64748b",textAlign:"center",padding:20}}>No tasks match filters.</div>}
+              {filteredRows.length===0 && <div style={{color:"#64748b",textAlign:"center",padding:20}}>No tasks match filters.</div>}
             </div>
           )}
         </div>
@@ -749,12 +945,14 @@ export default function App() {
         {/* RIGHT SIDEBAR */}
         <div style={S.rght}>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
-            <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth={2}><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+            <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth={2}>
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
             <span style={{fontWeight:700,fontSize:11,letterSpacing:1,color:"#38bdf8"}}>URGENCY DECK</span>
           </div>
-          {sidebarItems.length===0&&<div style={{color:"#64748b",fontSize:11,textAlign:"center",marginTop:20}}>All tasks implemented 🎉</div>}
-          {sidebarItems.map(t=>{
-            const b=urgencyMeta[t.urg]||urgencyMeta.ok;
+          {sidebarItems.length===0 && <div style={{color:"#64748b",fontSize:11,textAlign:"center",marginTop:20}}>All tasks implemented 🎉</div>}
+          {sidebarItems.map(t => {
+            const b = urgencyMeta[t.urg] || urgencyMeta.ok;
             return (
               <div key={t.id} style={{background:b.bg,border:`1px solid ${b.border}`,borderRadius:8,padding:9}}>
                 <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
@@ -772,10 +970,8 @@ export default function App() {
         </div>
       </div>
 
-      {showModal&&(
-        <AddModal onClose={()=>setShowModal(false)} onSave={addTask} saving={saving}
-          engineers={engineers} commodities={commodities} activities={activities}/>
-      )}
+      {showModal  && <AddModal    onClose={() => setShowModal(false)}  onSave={addTask}      saving={saving}/>}
+      {showImport && <ImportModal onClose={() => setShowImport(false)} onImport={handleImport} importing={importing}/>}
 
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0}
